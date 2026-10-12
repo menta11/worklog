@@ -1,0 +1,6 @@
+# 机器本地的个人配置，含真实路径、邮箱与署名。
+# 新机器上跑 `node scripts/extract.mjs --init` 重新生成。
+config.json
+
+# 个人日报样本，含真实项目名与同事姓名。
+reference/日报例子.txt
