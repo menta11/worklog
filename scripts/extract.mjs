@@ -570,10 +570,90 @@ function scanDocs(cfg, range, activeRepos, sessions, stats) {
 }
 
 // ────────────────────────────────────────────────────────────
+// 同刻批量落盘折叠
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 克隆/解压/双仓同步/worktree 检出会在一分钟内往同一个子树灌进成百份文档。
+ * 逐条列出既会把素材淹掉，也会让统计行的「文档 N」失去意义
+ * ——实测 92 天共 4551 条文档，其中 78% 来自这类落盘。
+ *
+ * 判据只有一条：同一天 · 同一分钟 · 同一「工作根 + 一级子目录」下 ≥ 阈值份。
+ *   · 分组键不细到完整目录——一次落盘会碎进几十个子目录，那里的簇会小到判不出来
+ *   · 阈值默认 15：实测真产出在分钟粒度的最大簇 ≤14（14 份接口文档、10 张 slide），
+ *     机器落盘最小 15（e2e test-results），正好切在空档上
+ *   · 处置是「折叠」不是「丢弃」：簇仍出一行带批注的摘要，读素材时据此自行判断
+ *
+ * 只作用于文件扫描这一路；transcript 侧的「文档写入」是真实会话行为，不折叠。
+ */
+function bulkGroupKey(abs, roots) {
+  const low = abs.toLowerCase();
+  for (const r of roots) {
+    const rl = path.resolve(r).toLowerCase();
+    if (!low.startsWith(rl + path.sep)) continue;
+    const rest = abs.slice(rl.length + 1).split(/[\\/]+/);
+    return rest.length > 1 ? rl + path.sep + rest[0].toLowerCase() : rl;
+  }
+  return '';
+}
+
+function commonDir(paths) {
+  let c = path.dirname(paths[0]);
+  for (const p of paths) {
+    while (c.includes(path.sep) && !p.toLowerCase().startsWith(c.toLowerCase() + path.sep)) {
+      const up = path.dirname(c);
+      if (up === c) break;
+      c = up;
+    }
+  }
+  return c;
+}
+
+/** entries 按时间序，元素为单条文档或一条折叠摘要，供渲染直接消费。 */
+function foldBulkLandings(docs, roots, foldAt) {
+  const keyOf = (d) => `${Math.floor(d.ms / 60000)}|${bulkGroupKey(d.path, roots)}`;
+
+  const groups = new Map();
+  for (const d of docs) {
+    const k = keyOf(d);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(d);
+  }
+
+  const entries = [];
+  const emitted = new Set();
+  for (const d of docs) { // docs 已按时间排序，折叠行落在簇内首条的位置
+    const k = keyOf(d);
+    const g = groups.get(k);
+    if (g.length < foldAt) {
+      entries.push({ kind: 'doc', doc: d });
+      continue;
+    }
+    if (emitted.has(k)) continue;
+    emitted.add(k);
+    const exts = new Map();
+    for (const x of g) {
+      const e = path.extname(x.path).toLowerCase() || '(无扩展名)';
+      exts.set(e, (exts.get(e) || 0) + 1);
+    }
+    entries.push({
+      kind: 'bulk',
+      ms: g[0].ms,
+      dir: commonDir(g.map((x) => x.path)),
+      count: g.length,
+      exts: [...exts].sort((a, b) => b[1] - a[1]).map(([e, n]) => `${e}×${n}`).join(' '),
+    });
+  }
+
+  const bulk = entries.filter((e) => e.kind === 'bulk');
+  return { entries, bulkGroups: bulk.length, bulkFiles: bulk.reduce((s, e) => s + e.count, 0) };
+}
+
+// ────────────────────────────────────────────────────────────
 // 渲染
 // ────────────────────────────────────────────────────────────
 
-function renderMarkdown(dateStr, range, sessions, commits, docs, stats) {
+function renderMarkdown(dateStr, range, sessions, commits, docEntries, stats) {
   const L = [];
   L.push(`# worklog 素材 ${dateStr}`);
   L.push('');
@@ -643,17 +723,23 @@ function renderMarkdown(dateStr, range, sessions, commits, docs, stats) {
 
   L.push('## 三、文档产出（非 git 目录，文件扫描）');
   L.push('');
-  if (docs.length === 0) {
+  if (docEntries.length === 0) {
     L.push('（无）');
   } else {
-    for (const d of docs) L.push(`  ${hhmm(d.ms)}  ${d.path}`);
+    for (const e of docEntries) {
+      if (e.kind === 'doc') L.push(`  ${hhmm(e.doc.ms)}  ${e.doc.path}`);
+      else L.push(`  ${hhmm(e.ms)}  ${e.dir}  （同刻批量落盘 ${e.count} 份 ${e.exts}，疑为克隆/解压/同步，未逐条列出）`);
+    }
   }
   L.push('');
 
   L.push('## 四、统计');
   L.push('');
   L.push(`文件扫描 ${stats.filesScanned} / 解析 ${stats.filesParsed} / 跳过 ${stats.filesSkipped} / 仓库 ${stats.reposScanned}`);
-  L.push(`用户输入 ${stats.promptsFound} / 提交 ${stats.commitsFound} / 文档 ${stats.docsFound}`);
+  const bulkNote = stats.bulkGroups
+    ? `（同刻批量落盘 ${stats.bulkFiles} 份，已折叠为 ${stats.bulkGroups} 行）`
+    : '';
+  L.push(`用户输入 ${stats.promptsFound} / 提交 ${stats.commitsFound} / 文档 ${stats.docsFound}${bulkNote}`);
   L.push('');
 
   return L.join('\n');
@@ -708,6 +794,10 @@ function validateConfig(raw, cfgPath) {
   if (raw.maxKeyframesPerDay !== undefined && (!Number.isInteger(raw.maxKeyframesPerDay) || raw.maxKeyframesPerDay < 1)) {
     errs.push('maxKeyframesPerDay: 必须是 ≥1 的整数（可省略，默认 15）');
   }
+  if (raw.bulkLandingFoldThreshold !== undefined
+    && (!Number.isInteger(raw.bulkLandingFoldThreshold) || raw.bulkLandingFoldThreshold < 2)) {
+    errs.push('bulkLandingFoldThreshold: 必须是 ≥2 的整数（可省略，默认 15；填一个极大的值即可关闭折叠）');
+  }
 
   if (errs.length) {
     throw new Error(`配置有误：${cfgPath}\n  · ${errs.join('\n  · ')}\n可运行 \`--init\` 查看建议值。`);
@@ -725,6 +815,7 @@ function validateConfig(raw, cfgPath) {
     },
     excludeProjectDirs: raw.excludeProjectDirs ?? [],
     maxKeyframesPerDay: raw.maxKeyframesPerDay ?? 15,
+    bulkLandingFoldThreshold: raw.bulkLandingFoldThreshold ?? 15,
   };
 
   // 自指防护：dataRoot 若也在扫描范围内，worklog 自己的提交会被当成工作痕迹回灌
@@ -922,6 +1013,7 @@ async function main() {
   const stats = {
     filesScanned: 0, filesParsed: 0, filesSkipped: 0, linesUnparsed: 0,
     reposScanned: 0, promptsFound: 0, commitsFound: 0, docsFound: 0,
+    bulkGroups: 0, bulkFiles: 0,
   };
 
   const repos = discoverRepos(cfg, stats);
@@ -932,6 +1024,9 @@ async function main() {
   stats.activeRepos = activeRepos.length;
   const sessions = await scanTranscripts(cfg, range, activeRepos, stats);
   const docs = scanDocs(cfg, range, activeRepos, sessions, stats);
+  const folded = foldBulkLandings(docs, cfg.workRoots, cfg.bulkLandingFoldThreshold);
+  stats.bulkGroups = folded.bulkGroups;
+  stats.bulkFiles = folded.bulkFiles;
   stats.elapsedMs = Date.now() - t0;
 
   if (args.json) {
@@ -947,10 +1042,12 @@ async function main() {
       })),
       commits: commits.map((c) => ({ repo: c.repo, time: hhmm(c.ms), hash: c.hash, authorDate: new Date(c.ms).toISOString(), subject: c.subject })),
       docs: docs.map((d) => ({ path: d.path, mtime: hhmm(d.ms), source: 'fs' })),
+      bulkLandings: folded.entries.filter((e) => e.kind === 'bulk')
+        .map((e) => ({ time: hhmm(e.ms), dir: e.dir, count: e.count })),
       stats,
     }, null, 2) + '\n');
   } else {
-    process.stdout.write(renderMarkdown(dateStr, range, sessions, commits, docs, stats));
+    process.stdout.write(renderMarkdown(dateStr, range, sessions, commits, folded.entries, stats));
   }
 }
 

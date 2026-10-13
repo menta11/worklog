@@ -67,6 +67,7 @@ node "<SKILL>/scripts/extract.mjs" --init
 | `authorIdentities.nameFallbackEmail` | 兜住「署名匹配但 email 是本机地址（如 `dev@localhost`）」的历史提交 |
 | `excludeProjectDirs` | 不扫的 transcript 项目目录（如 `C--windows-system32`） |
 | `maxKeyframesPerDay` | 关键帧条数上限，默认 `15` |
+| `bulkLandingFoldThreshold` | 同刻批量落盘的折叠阈值，默认 `15`。同一天·同一分钟·同一「工作根 + 一级子目录」下 ≥ 该数的文档折叠成一行批注——克隆/解压/双仓同步会一次灌进成百份，逐条列出会把素材淹掉。填一个极大的值即关闭折叠 |
 
 ### 迁移到另一台机器
 
@@ -283,11 +284,12 @@ git add -A && git commit -m "worklog: 26.10.12-26.10.18 周报"
 
 ```
 文件扫描 N / 解析 N / 跳过 N / 仓库 N / 活跃仓库 N
-用户输入 N / 提交 N / 文档 N
+用户输入 N / 提交 N / 文档 N（同刻批量落盘 N 份，已折叠为 N 行）
 ```
 
 - **用户输入为 0 且提交为 0** → 当天可能没干活，或提取出了问题，先确认再动手
 - **`跳过` 不为 0** → 有 transcript 读不动，在结果里提一句
+- **统计行带「同刻批量落盘」** → 正常，那是克隆/解压/双仓同步被判为批量落盘折叠了。折叠只在**呈现层**：`文档 N` 仍是真实总数，信息也没丢——那一行批注给了目录与份数。它只是「疑为」，若批注指到的目录看着像真产出，回原目录自查即可
 - **素材里出现 `.recon/`、`.verify/`、`node_modules/`、`plugins/*/skills/` 这类路径** → 过滤规则漏了，**报告出来**，别硬着头皮往下写
 
 ## 沟通
